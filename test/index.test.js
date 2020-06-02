@@ -111,6 +111,30 @@ describe('Given a vpc,', () => {
   });
 });
 
+describe('Given a security group,', () => {
+  it('function updates vpc', () => {
+    AWS.mock('EC2', 'describeVpcs', testData);
+    AWS.mock('EC2', 'describeSubnets', testData);
+    AWS.mock('EC2', 'describeSecurityGroups', testData);
+
+    const plugin = constructPlugin({
+      securityGroupNames: securityGroups,
+      vpcFromSecurityGroup: true,
+    });
+
+    return plugin.updateVpcConfig().then((data) => {
+      expect(data).to.eql({
+        securityGroupIds: ['sg-test'],
+        subnetIds: ['subnet-test-1', 'subnet-test-2', 'subnet-test-3'],
+      });
+    });
+  });
+
+  afterEach(() => {
+    AWS.restore();
+  });
+});
+
 describe('Given valid inputs for ', () => {
   let plugin;
 
@@ -127,7 +151,7 @@ describe('Given valid inputs for ', () => {
   }));
 
   it('Security Groups', () => plugin.getSecurityGroupIds(vpcId, securityGroups).then((data) => {
-    expect(data[0]).to.equal('sg-test');
+    expect(data.securityGroupIds[0]).to.equal('sg-test');
   }));
 
   afterEach(() => {

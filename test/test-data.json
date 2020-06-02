@@ -42,7 +42,8 @@
   "SecurityGroups": [
     {
       "GroupId": "sg-test",
-      "GroupName": "test_group_1"
+      "GroupName": "test_group_1",
+      "VpcId": "vpc-test"
     }
   ]
 }

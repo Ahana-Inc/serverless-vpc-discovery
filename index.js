@@ -1,7 +1,7 @@
-'use strict';
+"use strict";
 
-const AWS = require('aws-sdk');
-const _ = require('underscore');
+const AWS = require("aws-sdk");
+const _ = require("underscore");
 
 class VPCPlugin {
   constructor(serverless) {
@@ -9,7 +9,7 @@ class VPCPlugin {
 
     /* hooks are the acutal code that will run when called */
     this.hooks = {
-      'before:package:initialize': this.updateVpcConfig.bind(this),
+      "before:package:initialize": this.updateVpcConfig.bind(this),
     };
   }
 
@@ -29,40 +29,63 @@ class VPCPlugin {
 
     this.ec2 = new AWS.EC2();
 
-    this.serverless.cli.log('Updating VPC config...');
+    this.serverless.cli.log("Updating VPC config...");
     const service = this.serverless.service;
 
     // Checks if the serverless file is setup correctly
-    if (service.custom.vpc.vpcName == null || service.custom.vpc.subnetNames == null ||
-      service.custom.vpc.securityGroupNames == null) {
-      throw new Error('Serverless file is not configured correctly. Please see README for proper setup.');
+    if (
+      ((service.custom.vpc.vpcName == null ||
+        service.custom.vpc.subnetNames == null) &&
+        !service.custom.vpc.vpcFromSecurityGroup) ||
+      service.custom.vpc.securityGroupNames == null
+    ) {
+      throw new Error(
+        "Serverless file is not configured correctly. Please see README for proper setup."
+      );
     }
 
+    // backwards compatible
+    if (!service.custom.vpc.vpcFromSecurityGroup) {
+      // Returns the vpc with subnet and security group ids
+      return this.getVpcId(service.custom.vpc.vpcName)
+        .then((vpcId) => {
+          const promises = [
+            this.getSubnetIds(vpcId, service.custom.vpc.subnetNames),
+            this.getSecurityGroupIds(vpcId, service.custom.vpc.securityGroupNames),
+          ];
 
-    // Returns the vpc with subnet and security group ids
-    return this.getVpcId(service.custom.vpc.vpcName).then((vpcId) => {
-      const promises = [
-        this.getSubnetIds(vpcId, service.custom.vpc.subnetNames),
-        this.getSecurityGroupIds(vpcId, service.custom.vpc.securityGroupNames),
-      ];
+          return Promise.all(promises).then((values) => {
+            // Checks to see if either subnets or security gropus returned nothing
+            if (!values[0].length || !values[1].securityGroupIds.length) {
+              throw new Error("Vpc was not set");
+            }
 
-      return (Promise.all(promises).then((values) => {
-        // Checks to see if either subnets or security gropus returned nothing
-        if (!values[0].length || !values[1].length) {
-          throw new Error('Vpc was not set');
-        }
+            // Sets the serverless's vpc config
+            service.provider.vpc = {
+              subnetIds: values[0],
+              securityGroupIds: values[1].securityGroupIds,
+            };
 
-        // Sets the serverless's vpc config
-        service.provider.vpc = {
-          subnetIds: values[0],
-          securityGroupIds: values[1],
-        };
+            return service.provider.vpc;
+          });
+        })
+        .catch((err) => {
+          throw new Error(`Could not set vpc config. Message: ${err}`);
+        });
+    }
 
+    const result = {};
+    return this.getSecurityGroupIds(null, service.custom.vpc.securityGroupNames)
+      .then((securityGroups) => {
+        result.securityGroupIds = securityGroups.securityGroupIds;
+        return this.getSubnetIds(securityGroups.vpcId, service.custom.vpc.subnetNames);
+      })
+      .then((subnetIds) => {
+        result.subnetIds = subnetIds;
+
+        service.provider.vpc = result;
         return service.provider.vpc;
-      }));
-    }).catch((err) => {
-      throw new Error(`Could not set vpc config. Message: ${err}`);
-    });
+      });
   }
 
   /**
@@ -72,19 +95,24 @@ class VPCPlugin {
    */
   getVpcId(vpcName) {
     const vpcParams = {
-      Filters: [{
-        Name: 'tag:Name',
-        Values: [vpcName],
-      }],
+      Filters: [
+        {
+          Name: "tag:Name",
+          Values: [vpcName],
+        },
+      ],
     };
 
-    return this.ec2.describeVpcs(vpcParams).promise().then((data) => {
-      // If it cannot find a vpc, vpc does not exist for that name
-      if (data.Vpcs.length === 0) {
-        throw new Error('Invalid vpc name, it does not exist');
-      }
-      return data.Vpcs[0].VpcId;
-    });
+    return this.ec2
+      .describeVpcs(vpcParams)
+      .promise()
+      .then((data) => {
+        // If it cannot find a vpc, vpc does not exist for that name
+        if (data.Vpcs.length === 0) {
+          throw new Error("Invalid vpc name, it does not exist");
+        }
+        return data.Vpcs[0].VpcId;
+      });
   }
 
   /**
@@ -96,42 +124,50 @@ class VPCPlugin {
    */
   getSubnetIds(vpcId, subnetNames) {
     const paramsSubnet = {
-      Filters: [{
-        Name: 'vpc-id',
-        Values: [vpcId],
-      }, {
-        Name: 'tag:Name',
-        Values: subnetNames,
-      }],
+      Filters: [
+        {
+          Name: "vpc-id",
+          Values: [vpcId],
+        },
+      ],
     };
 
-    return this.ec2.describeSubnets(paramsSubnet).promise().then((data) => {
-      if (data.Subnets.length === 0) {
-        throw new Error('Invalid subnet name, it does not exist');
-      }
+    if (subnetNames && subnetNames.length > 0) {
+      paramsSubnet.Filters.push({
+        Name: "tag:Name",
+        Values: subnetNames,
+      });
+    }
 
-      if (paramsSubnet.Filters[1].Values.length !== data.Subnets.length) {
-        // Creates a list of the valid subnets
-        const validSubnets = data.Subnets.reduce((accum, val) => {
-          const nameTag = val.Tags.find(tag => tag.Key === 'Name');
+    return this.ec2
+      .describeSubnets(paramsSubnet)
+      .promise()
+      .then((data) => {
+        if (data.Subnets.length === 0) {
+          throw new Error("Invalid subnet name, it does not exist");
+        }
 
-          if (nameTag) {
-            accum.push(nameTag.Value);
-          }
+        if (paramsSubnet.Filters.length > 1 && paramsSubnet.Filters[1].Values.length !== data.Subnets.length) {
+          // Creates a list of the valid subnets
+          const validSubnets = data.Subnets.reduce((accum, val) => {
+            const nameTag = val.Tags.find((tag) => tag.Key === "Name");
 
-          return accum;
-        }, []);
-        // Compares the valid subents with ones given to find invalid subnet names
-        const missingSubnets = _.difference(paramsSubnet.Filters[1].Values, validSubnets);
+            if (nameTag) {
+              accum.push(nameTag.Value);
+            }
 
-        throw new Error(`Not all subnets were registered: ${missingSubnets}`);
-      }
-      const subnetIds = data.Subnets.map(obj => obj.SubnetId);
+            return accum;
+          }, []);
+          // Compares the valid subents with ones given to find invalid subnet names
+          const missingSubnets = _.difference(paramsSubnet.Filters[1].Values, validSubnets);
 
-      return subnetIds;
-    });
+          throw new Error(`Not all subnets were registered: ${missingSubnets}`);
+        }
+        const subnetIds = data.Subnets.map((obj) => obj.SubnetId);
+
+        return subnetIds;
+      });
   }
-
 
   /**
    *  Returns the promise that contains the security group IDs
@@ -141,31 +177,52 @@ class VPCPlugin {
    */
   getSecurityGroupIds(vpcId, securityGroupNames) {
     const paramsSecurity = {
-      Filters: [{
-        Name: 'vpc-id',
-        Values: [vpcId],
-      }, {
-        Name: 'group-name',
-        Values: securityGroupNames,
-      }],
-
+      Filters: [
+        {
+          Name: "group-name",
+          Values: securityGroupNames,
+        },
+      ],
     };
 
-    return this.ec2.describeSecurityGroups(paramsSecurity).promise().then((data) => {
-      if (data.SecurityGroups.length === 0) {
-        throw new Error('Invalid security group name, it does not exist');
-      }
+    if (vpcId) {
+      paramsSecurity.Filters.push({
+        Name: "vpc-id",
+        Values: [vpcId],
+      });
+    }
 
-      if (paramsSecurity.Filters[1].Values.length !== data.SecurityGroups.length) {
-        const validGroups = data.SecurityGroups.map(obj => obj.GroupName);
-        const missingGroups = _.difference(paramsSecurity.Filters[1].Values, validGroups);
-        throw new Error(`Not all security group were registered: ${missingGroups}`);
-      }
+    return this.ec2
+      .describeSecurityGroups(paramsSecurity)
+      .promise()
+      .then((data) => {
+        if (data.SecurityGroups.length === 0) {
+          throw new Error("Invalid security group name, it does not exist");
+        }
 
-      const securityGroupIds = data.SecurityGroups.map(obj => obj.GroupId);
+        if (
+          paramsSecurity.Filters[0].Values.length !== data.SecurityGroups.length
+        ) {
+          const validGroups = data.SecurityGroups.map((obj) => obj.GroupName);
+          const missingGroups = _.difference(paramsSecurity.Filters[0].Values, validGroups);
+          throw new Error(
+            `Not all security group were registered: ${missingGroups}`
+          );
+        }
 
-      return securityGroupIds;
-    });
+        const securityGroupIds = data.SecurityGroups.map((obj) => obj.GroupId);
+        const vpcIds = _.uniq(data.SecurityGroups.map((obj) => obj.VpcId));
+
+        if (vpcIds.length > 1 && !vpcId) {
+          throw new Error("Security group names match more than one VPC");
+        }
+
+        if (!vpcIds[0]) {
+          throw new Error("Must specify VPC name tag for EC2-Classic security groups")
+        }
+
+        return { securityGroupIds, vpcId: vpcIds[0] };
+      });
   }
 }
 module.exports = VPCPlugin;
